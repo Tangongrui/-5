@@ -1,0 +1,454 @@
+#ifndef CGEN_H
+#define CGEN_H
+
+#include <iostream>
+#include <vector>
+#include <map>
+#include "cool-tree.h"
+#include "emit.h"
+
+using namespace std;
+
+class CgenNode;
+class CgenClassTable;
+
+class Environment {
+private:
+    vector<vector<Symbol>> var_scopes;
+    vector<Symbol> param_table;
+    CgenNode* class_node;
+    CgenNode* parent_node;
+
+public:
+    Environment(CgenNode* cls_node = nullptr);
+    int LookUpVar(Symbol sym);
+    int LookUpParam(Symbol sym);
+    int LookUpAttrib(Symbol sym);
+    void EnterScope();
+    void ExitScope();
+    void AddVar(Symbol sym);
+    void AddParam(Symbol sym);
+    void SetClassNode(CgenNode* node);
+    CgenNode* GetClassNode();
+    void AddObstacle();
+};
+
+class CgenNode {
+private:
+    Symbol name;
+    Symbol parent_name;
+    CgenNode* parent_node;
+    vector<attr_class*> attributes;
+    vector<method_class*> methods;
+    vector<attr_class*> full_attributes;
+    vector<method_class*> full_methods;
+    map<Symbol, int> attrib_idx;
+    map<Symbol, int> dispatch_idx;
+    int class_tag;
+
+public:
+    CgenNode(Symbol n, Symbol p, CgenClassTable* ct);
+    Symbol get_name() { return name; }
+    CgenNode* get_parentnd() { return parent_node; }
+    Symbol get_parent_name() { return parent_name; }
+    int get_tag() { return class_tag; }
+    void load_full_attributes();
+    void load_full_methods();
+    vector<attr_class*> GetFullAttribs() { return full_attributes; }
+    vector<attr_class*> GetAttribs() { return attributes; }
+    vector<method_class*> GetFullMethods() { return full_methods; }
+    map<Symbol, int> GetAttribIdxTab() { return attrib_idx; }
+    map<Symbol, int> GetDispatchIdxTab() { return dispatch_idx; }
+    void code_protObj(ostream& s);
+    void code_init(ostream& s);
+    void code_methods(ostream& s);
+};
+
+class CgenClassTable {
+private:
+    vector<CgenNode*> class_nodes;
+    map<Symbol, CgenNode*> class_map;
+    int next_tag;
+    void install_basic_classes();
+    void build_inheritance_tree();
+
+public:
+    CgenClassTable(Classes classes);
+    void code_constants(ostream& s);
+    void code_class_nameTab(ostream& s);
+    void code_class_objTab(ostream& s);
+    void code_dispatchTabs(ostream& s);
+    void code_protObjs(ostream& s);
+    void code_class_inits(ostream& s);
+    void code_class_methods(ostream& s);
+    void code_global_data(ostream& s);
+    void code_global_text(ostream& s);
+    void code(ostream& s);
+    CgenNode* GetClassNode(Symbol sym) { return class_map[sym]; }
+    vector<CgenNode*> GetClassNodes() { return class_nodes; }
+};
+
+extern int labelnum;
+extern int cgen_Memmgr;
+
+void emit_load_int(ostream& s, Register reg, string val);
+void emit_load_string(ostream& s, Register reg, StringEntry* entry);
+void emit_load_bool(ostream& s, Register reg, BoolConst bc);
+void emit_push(ostream& s, Register reg);
+void emit_label_def(ostream& s, int label);
+
+#endif // CGEN_H
+
+
+#include "cgen.h"
+#include "cool-tree.h"
+#include "emit.h"
+#include <map>
+#include <vector>
+#include <string>
+
+using namespace std;
+
+int labelnum = 0;
+int cgen_Memmgr = 0;
+
+extern StringTable stringtable;
+extern IntTable inttable;
+extern BoolConst falsebool, truebool;
+
+const int OBJECT_TAG = 0;
+const int INT_TAG = 1;
+const int STRING_TAG = 2;
+const int BOOL_TAG = 3;
+const int IO_TAG = 4;
+
+#define WORD ".word"
+#define LABEL ":"
+#define LA "la"
+#define DEFAULT_OBJFIELDS 3
+#define STRING_SLOTS 1
+#define INT_SLOTS 1
+#define BOOL_SLOTS 1
+#define PROTOBJ_SUFFIX "_protObj"
+#define DISPTAB_SUFFIX "_dispTab"
+#define CLASSINIT_SUFFIX "_init"
+#define STRCONST_PREFIX "str_const"
+#define INTCONST_PREFIX "int_const"
+#define BOOLCONST_PREFIX "bool_const"
+#define CLASSNAMETAB "class_nameTab"
+#define CLASSOBJTAB "class_objTab"
+
+int Environment::LookUpAttrib(Symbol sym) {
+    if (class_node == nullptr) return -1;
+    map<Symbol, int> idx_tab = class_node->GetAttribIdxTab();
+    if (idx_tab.find(sym) != idx_tab.end()) {
+        return idx_tab[sym];
+    }
+    CgenNode* parent = class_node->get_parentnd();
+    while (parent != nullptr) {
+        idx_tab = parent->GetAttribIdxTab();
+        if (idx_tab.find(sym) != idx_tab.end()) {
+            return idx_tab[sym];
+        }
+        parent = parent->get_parentnd();
+    }
+    return -1;
+}
+
+Environment::Environment(CgenNode* cls_node) 
+    : class_node(cls_node), parent_node(nullptr) {
+    var_scopes.push_back(vector<Symbol>());
+    if (class_node != nullptr) {
+        parent_node = class_node->get_parentnd();
+    }
+}
+
+int Environment::LookUpVar(Symbol sym) {
+    for (int i = var_scopes.size() - 1; i >= 0; i--) {
+        vector<Symbol>& scope = var_scopes[i];
+        for (int j = 0; j < scope.size(); j++) {
+            if (scope[j] == sym) {
+                int offset = 0;
+                for (int k = 0; k < i; k++) {
+                    offset += var_scopes[k].size();
+                }
+                return offset + j;
+            }
+        }
+    }
+    return -1;
+}
+
+int Environment::LookUpParam(Symbol sym) {
+    for (int i = 0; i < param_table.size(); i++) {
+        if (param_table[i] == sym) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void Environment::EnterScope() {
+    var_scopes.push_back(vector<Symbol>());
+}
+
+void Environment::ExitScope() {
+    if (var_scopes.size() > 1) {
+        var_scopes.pop_back();
+    }
+}
+
+void Environment::AddVar(Symbol sym) {
+    var_scopes.back().push_back(sym);
+}
+
+void Environment::AddParam(Symbol sym) {
+    param_table.push_back(sym);
+}
+
+void Environment::SetClassNode(CgenNode* node) {
+    class_node = node;
+    parent_node = node->get_parentnd();
+}
+
+CgenNode* Environment::GetClassNode() {
+    return class_node;
+}
+
+void Environment::AddObstacle() {
+    static int obstacle_count = 0;
+    obstacle_count++;
+}
+
+CgenNode::CgenNode(Symbol n, Symbol p, CgenClassTable* ct) {
+    name = n;
+    parent_name = p;
+    parent_node = ct->GetClassNode(p);
+    class_tag = -1;
+    attributes.clear();
+    methods.clear();
+    full_attributes.clear();
+    full_methods.clear();
+    attrib_idx.clear();
+    dispatch_idx.clear();
+}
+
+void CgenNode::load_full_attributes() {
+    if (parent_node != nullptr) {
+        full_attributes = parent_node->GetFullAttribs();
+    }
+    for (auto attr : attributes) {
+        full_attributes.push_back(attr);
+        attrib_idx[attr->name] = full_attributes.size() - 1;
+    }
+}
+
+void CgenNode::load_full_methods() {
+    if (parent_node != nullptr) {
+        full_methods = parent_node->GetFullMethods();
+        dispatch_idx = parent_node->GetDispatchIdxTab();
+    }
+    for (auto method : methods) {
+        Symbol m_name = method->name;
+        bool overridden = false;
+        for (int i = 0; i < full_methods.size(); i++) {
+            if (full_methods[i]->name == m_name) {
+                full_methods[i] = method;
+                overridden = true;
+                break;
+            }
+        }
+        if (!overridden) {
+            full_methods.push_back(method);
+            dispatch_idx[m_name] = full_methods.size() - 1;
+        }
+    }
+}
+
+void CgenNode::code_protObj(ostream& s) {
+    vector<attr_class*> attribs = GetFullAttribs();
+    s << WORD << " -1" << "\t# GC eye catcher" << endl;
+    s << name->get_string() << PROTOBJ_SUFFIX << LABEL << endl;
+    s << WORD << class_tag << "\t# class tag" << endl;
+    s << WORD << (DEFAULT_OBJFIELDS + attribs.size()) << "\t# object size" << endl;
+    s << WORD << name->get_string() << DISPTAB_SUFFIX << "\t# dispatch table" << endl;
+    for (auto attr : attribs) {
+        Symbol type = attr->type_decl;
+        if (type == idtable.add_string("Int")) {
+            s << WORD;
+            inttable.lookup_string("0")->code_ref(s);
+            s << "\t# int default (0)" << endl;
+        } else if (type == idtable.add_string("Bool")) {
+            s << WORD;
+            falsebool.code_ref(s);
+            s << "\t# bool default (false)" << endl;
+        } else if (type == idtable.add_string("String")) {
+            s << WORD;
+            stringtable.lookup_string("")->code_ref(s);
+            s << "\t# string default (empty)" << endl;
+        } else {
+            s << WORD << "0" << "\t# default void" << endl;
+        }
+    }
+}
+
+CgenClassTable::CgenClassTable(Classes classes) {
+    next_tag = 0;
+    class_nodes.clear();
+    class_map.clear();
+    install_basic_classes();
+    for (int i = classes->first(); classes->more(i); i = classes->next(i)) {
+        Class_ cls = classes->nth(i);
+        Symbol cls_name = cls->name;
+        Symbol parent_name = cls->parent;
+        CgenNode* node = new CgenNode(cls_name, parent_name, this);
+        for (int j = cls->features->first(); cls->features->more(j); j = cls->features->next(j)) {
+            Feature_ feat = cls->features->nth(j);
+            if (feat->is_attr()) {
+                node->attributes.push_back(static_cast<attr_class*>(feat));
+            } else {
+                node->methods.push_back(static_cast<method_class*>(feat));
+            }
+        }
+        class_nodes.push_back(node);
+        class_map[cls_name] = node;
+        node->class_tag = next_tag++;
+    }
+    build_inheritance_tree();
+}
+
+void CgenClassTable::install_basic_classes() {
+    Symbol obj_name = idtable.add_string("Object");
+    CgenNode* obj_node = new CgenNode(obj_name, idtable.add_string(""), this);
+    obj_node->class_tag = OBJECT_TAG;
+    class_nodes.push_back(obj_node);
+    class_map[obj_name] = obj_node;
+    next_tag++;
+
+    Symbol int_name = idtable.add_string("Int");
+    CgenNode* int_node = new CgenNode(int_name, obj_name, this);
+    int_node->class_tag = INT_TAG;
+    class_nodes.push_back(int_node);
+    class_map[int_name] = int_node;
+    next_tag++;
+
+    Symbol str_name = idtable.add_string("String");
+    CgenNode* str_node = new CgenNode(str_name, obj_name, this);
+    str_node->class_tag = STRING_TAG;
+    class_nodes.push_back(str_node);
+    class_map[str_name] = str_node;
+    next_tag++;
+
+    Symbol bool_name = idtable.add_string("Bool");
+    CgenNode* bool_node = new CgenNode(bool_name, obj_name, this);
+    bool_node->class_tag = BOOL_TAG;
+    class_nodes.push_back(bool_node);
+    class_map[bool_name] = bool_node;
+    next_tag++;
+
+    Symbol io_name = idtable.add_string("IO");
+    CgenNode* io_node = new CgenNode(io_name, obj_name, this);
+    io_node->class_tag = IO_TAG;
+    class_nodes.push_back(io_node);
+    class_map[io_name] = io_node;
+    next_tag++;
+}
+
+void CgenClassTable::build_inheritance_tree() {
+    for (auto node : class_nodes) {
+        node->load_full_attributes();
+        node->load_full_methods();
+    }
+}
+
+void CgenClassTable::code_constants(ostream& s) {
+    stringtable.add_string("");
+    inttable.add_string("0");
+
+    s << "# String Constants" << endl;
+    vector<StringEntry*> str_entries = stringtable.all_entries();
+    for (auto entry : str_entries) {
+        s << WORD << " -1" << "\t# GC eye catcher" << endl;
+        entry->code_ref(s);
+        s << LABEL << endl;
+        s << WORD << STRING_TAG << "\t# String class tag" << endl;
+        int str_len = entry->get_len();
+        int obj_size = DEFAULT_OBJFIELDS + STRING_SLOTS + (str_len + 3) / 4;
+        s << WORD << obj_size << "\t# String object size" << endl;
+        s << WORD << "String" << DISPTAB_SUFFIX << "\t# String dispatch table" << endl;
+        IntEntry* len_entry = inttable.lookup_string(to_string(str_len));
+        s << WORD;
+        len_entry->code_ref(s);
+        s << "\t# String length" << endl;
+        s << ".ascii \"" << entry->get_string() << "\"" << endl;
+        s << ".align 2" << endl << endl;
+    }
+
+    s << "# Integer Constants" << endl;
+    vector<IntEntry*> int_entries = inttable.all_entries();
+    for (auto entry : int_entries) {
+        s << WORD << " -1" << "\t# GC eye catcher" << endl;
+        entry->code_ref(s);
+        s << LABEL << endl;
+        s << WORD << INT_TAG << "\t# Int class tag" << endl;
+        s << WORD << (DEFAULT_OBJFIELDS + INT_SLOTS) << "\t# Int object size" << endl;
+        s << WORD << "Int" << DISPTAB_SUFFIX << "\t# Int dispatch table" << endl;
+        s << WORD << entry->get_string() << "\t# Int value" << endl << endl;
+    }
+
+    s << "# Boolean Constants" << endl;
+    s << WORD << " -1" << "\t# GC eye catcher" << endl;
+    falsebool.code_ref(s);
+    s << LABEL << endl;
+    s << WORD << BOOL_TAG << "\t# Bool class tag" << endl;
+    s << WORD << (DEFAULT_OBJFIELDS + BOOL_SLOTS) << "\t# Bool object size" << endl;
+    s << WORD << "Bool" << DISPTAB_SUFFIX << "\t# Bool dispatch table" << endl;
+    s << WORD << "0" << "\t# Bool value (false)" << endl << endl;
+
+    s << WORD << " -1" << "\t# GC eye catcher" << endl;
+    truebool.code_ref(s);
+    s << LABEL << endl;
+    s << WORD << BOOL_TAG << "\t# Bool class tag" << endl;
+    s << WORD << (DEFAULT_OBJFIELDS + BOOL_SLOTS) << "\t# Bool object size" << endl;
+    s << WORD << "Bool" << DISPTAB_SUFFIX << "\t# Bool dispatch table" << endl;
+    s << WORD << "1" << "\t# Bool value (true)" << endl << endl;
+}
+
+void CgenClassTable::code_class_nameTab(ostream& s) {
+    s << CLASSNAMETAB << LABEL << endl;
+    for (auto node : class_nodes) {
+        Symbol cls_name = node->get_name();
+        StringEntry* str_entry = stringtable.lookup_string(cls_name->get_string());
+        s << WORD;
+        str_entry->code_ref(s);
+        s << "\t# " << cls_name->get_string() << " class name" << endl;
+    }
+    s << endl;
+}
+
+void CgenClassTable::code_class_objTab(ostream& s) {
+    s << CLASSOBJTAB << LABEL << endl;
+    for (auto node : class_nodes) {
+        Symbol cls_name = node->get_name();
+        s << WORD << cls_name->get_string() << PROTOBJ_SUFFIX << "\t# " << cls_name->get_string() << " protObj" << endl;
+        s << WORD << cls_name->get_string() << CLASSINIT_SUFFIX << "\t# " << cls_name->get_string() << " init method" << endl;
+    }
+    s << endl;
+}
+
+void CgenClassTable::code_dispatchTabs(ostream& s) {
+    for (auto node : class_nodes) {
+        Symbol cls_name = node->get_name();
+        s << cls_name->get_string() << DISPTAB_SUFFIX << LABEL << endl;
+        vector<method_class*> methods = node->GetFullMethods();
+        for (auto method : methods) {
+            s << WORD << cls_name->get_string() << "_" << method->name->get_string() << "\t# " << method->name->get_string() << " method" << endl;
+        }
+        s << endl;
+    }
+}
+
+void CgenClassTable::code_protObjs(ostream& s) {
+    s << "# Pro
+
+
